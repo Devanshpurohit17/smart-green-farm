@@ -1,14 +1,16 @@
-# app.py - Crop Recommendation (Model A) with optional Postgres saving (Supabase)
+# app.py - Smart Green Farm: Crop Recommendation (Model A)
+# Copy-paste this file entirely into your repo root (app.py).
 import json
 from pathlib import Path
 from datetime import datetime
+import os
 
 import joblib
 import pandas as pd
 import numpy as np
 import streamlit as st
 
-# SQLAlchemy for DB
+# SQLAlchemy imports
 from sqlalchemy import (
     create_engine, MetaData, Table, Column,
     Integer, Float, String, Text, DateTime as SA_DateTime
@@ -16,11 +18,11 @@ from sqlalchemy import (
 from sqlalchemy.exc import SQLAlchemyError
 
 # -----------------------------
-# CONFIG - paths (cloud-safe)
+# Config / paths
 # -----------------------------
 BASE_DIR = Path(__file__).parent
-DATA_FILENAME = "Crop_recommendation.csv"         # update if your CSV name differs
-MODEL_FILENAME = "hybrid_crop_reco_model.pkl"     # your trained model file
+DATA_FILENAME = "Crop_recommendation.csv"         # change only if your CSV has a different name
+MODEL_FILENAME = "hybrid_crop_reco_model.pkl"     # change only if your model filename differs
 
 DATA_PATH = BASE_DIR / DATA_FILENAME
 MODEL_PATH = BASE_DIR / MODEL_FILENAME
@@ -29,11 +31,11 @@ st.set_page_config(page_title="Smart Green Farm - Crop Recommendation",
                    page_icon="🌿", layout="wide")
 
 # -----------------------------
-# CSS (light accessible design)
+# Simple CSS for readability
 # -----------------------------
 CUSTOM_CSS = """
 <style>
-.stApp { background: linear-gradient(135deg,#e9f7ee 0%, #f3fbf9 100%); color: #0b3b18; font-family: "Segoe UI", sans-serif;}
+.stApp { background: linear-gradient(135deg,#f0faf0 0%, #f7fdf7 100%); color: #0b3b18; font-family: "Segoe UI", sans-serif;}
 .hero-title { font-size:28px; font-weight:700; color:#0b3b18; margin:18px 0; }
 .card { background: rgba(255,255,255,0.95); border-radius:12px; padding:16px; box-shadow: 0 8px 20px rgba(0,0,0,0.06); }
 .result-card { background: linear-gradient(135deg,#81c784,#43a047); color:#062e12; padding:14px; border-radius:12px; font-weight:700; text-align:center; }
@@ -44,22 +46,21 @@ CUSTOM_CSS = """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 # -----------------------------
-# Load model + dataset safely
+# Load model + stats (cached)
 # -----------------------------
 @st.cache_resource
 def load_model_and_stats():
-    # Check files
+    # check files exist
     if not DATA_PATH.exists():
-        st.error(f"Missing dataset file: {DATA_FILENAME}. Put it in the same folder as app.py")
+        st.error(f"Missing dataset file: {DATA_FILENAME}. Please place it next to app.py in the repo root.")
         st.stop()
     if not MODEL_PATH.exists():
-        st.error(f"Missing model file: {MODEL_FILENAME}. Put it in the same folder as app.py")
+        st.error(f"Missing model file: {MODEL_FILENAME}. Please place it next to app.py in the repo root.")
         st.stop()
 
-    # load CSV (same one used for training)
     data = pd.read_csv(DATA_PATH)
 
-    # ensure expected feature columns exist (common crop features)
+    # required features - update if your training features differ
     feature_cols = ['N', 'P', 'K', 'temperature', 'humidity', 'ph', 'rainfall']
     for c in feature_cols:
         if c not in data.columns:
@@ -79,15 +80,16 @@ def rng(col):
     return col_min, col_max, col_mean
 
 # -----------------------------
-# Database (Postgres) setup
+# Database setup (SQLAlchemy + Supabase)
 # -----------------------------
 ENGINE = None
 metadata = MetaData()
 submissions_table = None
 
-# Get DB URL from Streamlit secrets or environment
+# Read DATABASE_URL from Streamlit secrets (preferred) or environment
 db_url = None
 try:
+    # st.secrets supports both top-level and nested keys
     if "DATABASE_URL" in st.secrets:
         db_url = st.secrets["DATABASE_URL"]
     elif "DATABASE" in st.secrets and "url" in st.secrets["DATABASE"]:
@@ -96,21 +98,25 @@ except Exception:
     db_url = None
 
 if not db_url:
-    import os
     db_url = os.environ.get("DATABASE_URL")
+
+# If the URL exists, ensure sslmode is present (Supabase requires SSL)
+if db_url and "sslmode" not in db_url:
+    if "?" in db_url:
+        db_url = db_url + "&sslmode=require"
+    else:
+        db_url = db_url + "?sslmode=require"
 
 if db_url:
     try:
-        # require SSL explicitly (helps in many hosted environments)
-ENGINE = create_engine(db_url, pool_pre_ping=True, connect_args={"sslmode": "require"})
-
+        # Use connect_args to require SSL explicitly (helps some runtimes)
+        ENGINE = create_engine(db_url, pool_pre_ping=True, connect_args={"sslmode": "require"})
         # Build submissions table schema dynamically from feature_cols
         cols = [
             Column("id", Integer, primary_key=True, autoincrement=True),
             Column("submitted_at", SA_DateTime, nullable=False),
             Column("source", String(64), nullable=True),
         ]
-        # feature columns as floats
         for c in feature_cols:
             safe_name = c.replace(" ", "_").replace("-", "_")[:60]
             cols.append(Column(safe_name, Float))
@@ -120,16 +126,16 @@ ENGINE = create_engine(db_url, pool_pre_ping=True, connect_args={"sslmode": "req
             Column("notes", Text, nullable=True),
         ]
         submissions_table = Table("crop_submissions", metadata, *cols)
+        # create table if not exists
         metadata.create_all(ENGINE)
-        connected_msg = "Connected to cloud DB (submissions will be saved)."
+        db_msg = "Connected to DATABASE and ensured table 'crop_submissions' exists."
     except SQLAlchemyError as ex:
         ENGINE = None
         submissions_table = None
-        connected_msg = f"DB connection failed: {str(ex)}"
+        db_msg = f"DB connection failed: {ex}"
 else:
-    connected_msg = "No DATABASE_URL found. Submissions will NOT be saved."
+    db_msg = "No DATABASE_URL found in Streamlit secrets or environment. Submissions will not be saved."
 
-# helper to save
 def save_submission(conn, inputs: dict, predicted_crop=None, proba=None, source="streamlit_app", notes=None):
     ins = {
         "submitted_at": datetime.utcnow(),
@@ -151,7 +157,7 @@ def save_submission(conn, inputs: dict, predicted_crop=None, proba=None, source=
         return None
 
 # -----------------------------
-# Sidebar + info
+# Sidebar
 # -----------------------------
 with st.sidebar:
     st.markdown(f"<div class='sidebar-title'>🌿 Smart Green Farm</div>", unsafe_allow_html=True)
@@ -163,24 +169,24 @@ with st.sidebar:
         st.write(f"- **{col}**: `{mn:.1f}` to `{mx:.1f}`")
     st.markdown("---")
     if ENGINE:
-        st.success(connected_msg)
+        st.success(db_msg)
     else:
-        st.info(connected_msg)
+        st.info(db_msg)
+    st.markdown("---")
+    st.write("Tip: If you want submissions saved, add the Supabase Postgres URI to Streamlit Secrets as `DATABASE_URL` (include sslmode=require).")
 
 # -----------------------------
 # Main UI
 # -----------------------------
 st.markdown('<div class="hero-title">Smart Green Farm – Crop Recommendation</div>', unsafe_allow_html=True)
-st.write("Simulate your farm conditions (within training ranges) and click Recommend Crop.")
+st.write("Simulate your farm conditions within realistic training ranges and click Recommend Crop.")
 
 left_col, right_col = st.columns([2, 1])
 
-# LEFT: inputs
 with left_col:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Field and Soil Conditions")
 
-    # read ranges
     N_min, N_max, N_mean = rng("N")
     P_min, P_max, P_mean = rng("P")
     K_min, K_max, K_mean = rng("K")
@@ -189,14 +195,11 @@ with left_col:
     pH_min, pH_max, pH_mean = rng("ph")
     R_min, R_max, R_mean = rng("rainfall")
 
-    # defensive checks and sliders
     def safe_slider(label, mn, mx, default, step_hint=None):
-        # handle constant columns
         if mx <= mn:
             st.info(f"'{label}' appears constant in training data (value = {mn}).")
             val = st.number_input(label, value=float(mn), disabled=True)
             return float(val)
-        # step selection
         rng_val = mx - mn
         if step_hint:
             step = step_hint
@@ -205,7 +208,6 @@ with left_col:
                 step = 1.0
             else:
                 step = max(rng_val / 40.0, 0.1)
-        # clamp default
         default = float(max(min(default, mx), mn))
         return st.slider(label, min_value=float(mn), max_value=float(mx), value=default, step=float(step))
 
@@ -220,7 +222,6 @@ with left_col:
     st.markdown('</div>', unsafe_allow_html=True)
     predict_button = st.button("Recommend Crop", use_container_width=True)
 
-# RIGHT: output
 with right_col:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Recommendation")
@@ -237,11 +238,9 @@ with right_col:
         if crop is not None:
             st.markdown(f'<div class="result-card">Recommended crop: {crop}</div>', unsafe_allow_html=True)
 
-            # interpretation text
             st.markdown("#### Interpretation")
-            st.write("Recommendation is based on training data ranges and the learned model patterns. Use local knowledge before applying in real field.")
+            st.write("Recommendation is based on training data ranges and learned patterns. Use local knowledge before applying in a real field.")
 
-            # probabilities if available
             if hasattr(model, "predict_proba"):
                 try:
                     proba = model.predict_proba(df_in)[0]
@@ -254,8 +253,8 @@ with right_col:
             else:
                 proba = None
 
-            # Save submission to DB if configured
-            if ENGINE and submissions_table is not None:
+            # Save to DB if configured
+            if ENGINE is not None and submissions_table is not None:
                 try:
                     with ENGINE.begin() as conn:
                         new_id = save_submission(conn,
@@ -270,10 +269,23 @@ with right_col:
         else:
             st.info("No recommendation available.")
     else:
-        st.write("Adjust the sliders and click **Recommend Crop** to get a suggestion.")
+        st.write("Adjust sliders and click **Recommend Crop** to get a suggestion.")
     st.markdown('</div>', unsafe_allow_html=True)
 
-# Footer
 st.markdown("---")
 st.caption("Smart Green Farm prototype • Model A (Crop Recommendation)")
+
+# Optional: show recent submissions if connected
+if ENGINE is not None and submissions_table is not None:
+    try:
+        with ENGINE.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, submitted_at, predicted_crop FROM public.crop_submissions ORDER BY id DESC LIMIT 8"
+            ).fetchall()
+        if rows:
+            st.markdown("### Recent submissions (latest 8)")
+            df_rows = pd.DataFrame(rows, columns=["id", "submitted_at", "predicted_crop"])
+            st.table(df_rows)
+    except Exception:
+        pass
 
