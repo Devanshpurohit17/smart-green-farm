@@ -1,247 +1,173 @@
-# --------------------------------------------
-# HYBRID FARM AI – MODEL A:
-# ADVANCED CROP RECOMMENDATION
-# 4 SUPERVISED + 2 UNSUPERVISED
-# --------------------------------------------
+# app.py
+import json
+from pathlib import Path
+from datetime import datetime
+import os
 
+import joblib
 import pandas as pd
 import numpy as np
+import streamlit as st
 
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score, RandomizedSearchCV
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.svm import SVC
-from sklearn.neighbors import KNeighborsClassifier  # NEW
-
-from sklearn.cluster import KMeans                   # UNSUPERVISED 1
-from sklearn.decomposition import PCA                # UNSUPERVISED 2
-
-import seaborn as sns
-import matplotlib.pyplot as plt
-import joblib
-
-# --------------------------------------------
-# 1. LOAD DATA
-# --------------------------------------------
-
-
-# 1. LOAD DATA
-path = r"E:\AIML ASSIGNMENT\Crop_recommendation.csv"   # SAME as website
-data = pd.read_csv(path)
-
-
-print("Dataset loaded successfully")
-print(data.head())
-print("Shape:", data.shape)
-print("Columns:", data.columns.tolist())
-
-# --------------------------------------------
-# 2. BASIC CHECKS
-# --------------------------------------------
-
-print("\nMissing values:")
-print(data.isnull().sum())
-
-print("\nCrop distribution:")
-print(data['label'].value_counts())
-
-# --------------------------------------------
-# 3. FEATURES AND TARGET
-# --------------------------------------------
-
-feature_cols = ['N', 'P', 'K', 'temperature', 'humidity', 'ph', 'rainfall']
-X = data[feature_cols]
-y = data['label']
-
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y,
-    test_size=0.2,
-    random_state=42,
-    stratify=y
+from sqlalchemy import (
+    create_engine, MetaData, Table, Column,
+    Integer, Float, String, Text, DateTime as SA_DateTime
 )
+from sqlalchemy.exc import SQLAlchemyError
 
-print("\nTrain shape:", X_train.shape, "Test shape:", X_test.shape)
+# -----------------------------
+# SAFE RELATIVE LOCATIONS
+# -----------------------------
+DATA_FILENAME = "Crop_recommendation.csv"
+MODEL_FILENAME = "hybrid_crop_reco_model.pkl"
 
-# --------------------------------------------
-# 4. DEFINE SUPERVISED MODELS (4 Pipelines)
-# --------------------------------------------
+DATA_PATH = Path(DATA_FILENAME)
+MODEL_PATH = Path(MODEL_FILENAME)
 
-pipelines = {
-    "LogisticRegression": Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf", LogisticRegression(max_iter=500, multi_class="multinomial"))
-    ]),
+st.set_page_config(page_title="Smart Green Farm - Crop Recommendation",
+                   page_icon="🌿", layout="wide")
 
-    "SVM_RBF": Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf", SVC(kernel="rbf"))
-    ]),
+# -----------------------------
+# MODEL + DATA LOAD
+# -----------------------------
+@st.cache_resource(show_spinner=False)
+def load_model():
+    if not MODEL_PATH.exists():
+        st.error(f"Model file not found: {MODEL_FILENAME}")
+        st.stop()
+    return joblib.load(MODEL_PATH)
 
-    "RandomForest": Pipeline([
-        ("scaler", StandardScaler(with_mean=False)),
-        ("clf", RandomForestClassifier(random_state=42))
-    ]),
+@st.cache_data(show_spinner=False)
+def load_data():
+    if not DATA_PATH.exists():
+        st.error(f"Dataset missing: {DATA_FILENAME}")
+        st.stop()
+    data = pd.read_csv(DATA_PATH)
+    feature_cols = ['N','P','K','temperature','humidity','ph','rainfall']
+    for col in feature_cols:
+        if col not in data.columns:
+            st.error(f"Feature '{col}' missing in CSV")
+            st.stop()
+    stats = data[feature_cols].describe()
 
-    "KNN": Pipeline([  # NEW supervised model
-        ("scaler", StandardScaler()),
-        ("clf", KNeighborsClassifier())
-    ])
-}
+    if "min" not in stats.index or "max" not in stats.index:
+        st.error("CSV is malformed — stats not available")
+        st.stop()
 
-# --------------------------------------------
-# 5. CROSS-VALIDATION TO COMPARE MODELS
-# --------------------------------------------
+    return data, stats, feature_cols
 
-cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-cv_results = {}
+model = load_model()
+full_data, stats, feature_cols = load_data()
 
-for name, pipe in pipelines.items():
-    scores = cross_val_score(pipe, X, y, cv=cv, scoring="accuracy", n_jobs=-1)
-    cv_results[name] = scores
-    print("\nModel:", name)
-    print("Cross-validation scores:", scores)
-    print("Mean accuracy: {:.2f}%".format(scores.mean() * 100))
+def rng(col):
+    mn = float(stats.loc["min", col])
+    mx = float(stats.loc["max", col])
+    mean = float(stats.loc["mean", col])
+    return mn, mx, mean
 
-# --------------------------------------------
-# 6. SELECT BEST BASE MODEL
-# --------------------------------------------
+# -----------------------------
+# DATABASE CONNECTION
+# -----------------------------
+ENGINE = None
+metadata = MetaData()
+submissions_table = None
 
-best_base_model_name = max(cv_results, key=lambda k: cv_results[k].mean())
-print("\nBest base model:", best_base_model_name)
+db_url = None
+try:
+    if "DATABASE_URL" in st.secrets:
+        db_url = st.secrets["DATABASE_URL"]
+    elif "DATABASE" in st.secrets and "url" in st.secrets["DATABASE"]:
+        db_url = st.secrets["DATABASE"]["url"]
+except Exception:
+    db_url = None
 
-# --------------------------------------------
-# 7. HYPERPARAMETER TUNING FOR BEST MODEL
-# --------------------------------------------
+if not db_url:
+    db_url = os.environ.get("DATABASE_URL")
 
-if best_base_model_name == "RandomForest":
-    pipe = pipelines["RandomForest"]
-    param_distributions = {
-        "clf__n_estimators": [100, 200, 300, 400],
-        "clf__max_depth": [None, 10, 20, 30],
-        "clf__min_samples_split": [2, 5, 10],
-        "clf__min_samples_leaf": [1, 2, 4],
-        "clf__max_features": ["sqrt", "log2", None]
+if db_url:
+    try:
+        ENGINE = create_engine(db_url, pool_pre_ping=True)
+        cols = [
+            Column("id", Integer, primary_key=True),
+            Column("submitted_at", SA_DateTime, nullable=False)
+        ]
+        for c in feature_cols:
+            cols.append(Column(c.replace(" ", "_"), Float))
+
+        cols += [
+            Column("predicted_crop", String(256)),
+            Column("predicted_proba", Text),
+        ]
+
+        submissions_table = Table("crop_submissions", metadata, *cols)
+        metadata.create_all(ENGINE)
+        db_status = "Connected to Cloud DB"
+    except Exception as e:
+        submissions_table = None
+        db_status = f"DB failed: {str(e)}"
+else:
+    db_status = "No DB URL — submissions NOT saved"
+
+# -----------------------------
+# SAVE FUNCTION
+# -----------------------------
+def save_submission(conn, inputs, crop, proba):
+    ins = {
+        "submitted_at": datetime.utcnow(),
+        "predicted_crop": crop,
+        "predicted_proba": json.dumps(np.array(proba, dtype=float).tolist()) if proba is not None else None,
     }
+    for k,v in inputs.items():
+        ins[k] = float(v)
 
-elif best_base_model_name == "SVM_RBF":
-    pipe = pipelines["SVM_RBF"]
-    param_distributions = {
-        "clf__C": [0.1, 1, 10, 50, 100],
-        "clf__gamma": ["scale", 0.01, 0.001, 0.0001]
-    }
+    conn.execute(submissions_table.insert().values(**ins))
 
-elif best_base_model_name == "LogisticRegression":
-    pipe = pipelines["LogisticRegression"]
-    param_distributions = {
-        "clf__C": [0.01, 0.1, 1, 10, 100]
-    }
+# -----------------------------
+# UI
+# -----------------------------
+st.title("🌿 Smart Green Farm – Crop Recommendation")
 
-else:  # KNN
-    pipe = pipelines["KNN"]
-    param_distributions = {
-        "clf__n_neighbors": [3, 5, 7, 9, 11],
-        "clf__weights": ["uniform", "distance"],
-        "clf__p": [1, 2]  # 1 = Manhattan, 2 = Euclidean
-    }
+with st.sidebar:
+    st.info(db_status)
+    st.subheader("Training Ranges")
+    for col in feature_cols:
+        mn, mx, _ = rng(col)
+        st.write(f"{col}: {mn:.1f} → {mx:.1f}")
 
-print("\nStarting hyperparameter tuning...")
-search = RandomizedSearchCV(
-    estimator=pipe,
-    param_distributions=param_distributions,
-    n_iter=20,
-    scoring="accuracy",
-    n_jobs=-1,
-    cv=cv,
-    random_state=42,
-    verbose=1
-)
+# -----------------------------
+# INPUTS
+# -----------------------------
+left, right = st.columns([2,1])
 
-search.fit(X_train, y_train)
+with left:
+    st.subheader("Enter Conditions")
 
-print("\nBest hyperparameters:")
-print(search.best_params_)
-print("Best CV score: {:.2f}%".format(search.best_score_ * 100))
+    def safe_slider(label, mn, mx, default, step=1.0):
+        if np.isnan(mn) or np.isnan(mx) or mx <= mn:
+            return st.number_input(label, value=default)
+        default = float(max(min(default, mx), mn))
+        return st.slider(label, float(mn), float(mx), default, float(step))
 
-best_model = search.best_estimator_
+    vals = {}
+    for col in feature_cols:
+        mn, mx, mean = rng(col)
+        vals[col] = safe_slider(col, mn, mx, mean)
 
-# --------------------------------------------
-# 8. EVALUATE ON TEST SET (BEST SUPERVISED MODEL)
-# --------------------------------------------
+    if st.button("Recommend Crop"):
+        df_in = pd.DataFrame([vals], columns=feature_cols)
+        crop = model.predict(df_in)[0]
 
-y_pred = best_model.predict(X_test)
+        with right:
+            st.success(f"🌱 Recommended Crop: **{crop}**")
 
-test_acc = accuracy_score(y_test, y_pred)
-print("\nFinal Test Accuracy: {:.2f}%".format(test_acc * 100))
+            if hasattr(model, "predict_proba"):
+                proba = model.predict_proba(df_in)[0]
+                st.write(pd.DataFrame({"Crop": model.classes_, "Prob": np.round(proba,3)}))
 
-print("\nClassification report:")
-print(classification_report(y_test, y_pred))
-
-# Confusion Matrix
-cm = confusion_matrix(y_test, y_pred, labels=sorted(y.unique()))
-plt.figure(figsize=(10, 8))
-sns.heatmap(cm, annot=False, fmt='d',
-            xticklabels=sorted(y.unique()),
-            yticklabels=sorted(y.unique()))
-plt.title("Confusion Matrix - Best Crop Model")
-plt.xlabel("Predicted")
-plt.ylabel("Actual")
-plt.tight_layout()
-plt.show()
-
-# --------------------------------------------
-# 9. UNSUPERVISED ANALYSIS (2 ALGORITHMS)
-#    1) K-Means Clustering
-#    2) PCA (for 2D visualization)
-# --------------------------------------------
-
-print("\n--- UNSUPERVISED LEARNING SECTION ---")
-
-# Scale features for unsupervised learning
-scaler_unsup = StandardScaler()
-X_scaled = scaler_unsup.fit_transform(X)
-
-# 9.1 K-Means Clustering
-kmeans = KMeans(n_clusters=5, random_state=42, n_init=10)
-clusters = kmeans.fit_predict(X_scaled)
-data["cluster_kmeans"] = clusters
-
-print("\nK-Means cluster counts:")
-print(data["cluster_kmeans"].value_counts())
-
-# Optional: Cluster vs crop frequency
-cluster_crop_counts = pd.crosstab(data["cluster_kmeans"], data["label"])
-print("\nK-Means clusters vs crop labels:")
-print(cluster_crop_counts)
-
-# 9.2 PCA for Visualization
-pca = PCA(n_components=2, random_state=42)
-X_pca = pca.fit_transform(X_scaled)
-
-plt.figure(figsize=(8, 6))
-scatter = plt.scatter(X_pca[:, 0], X_pca[:, 1], c=clusters, alpha=0.6)
-plt.title("PCA (2D) of Crop Dataset with K-Means Clusters")
-plt.xlabel("PC1")
-plt.ylabel("PC2")
-plt.tight_layout()
-plt.show()
-
-# --------------------------------------------
-# 10. SAVE BEST SUPERVISED MODEL FOR WEBSITE
-# --------------------------------------------
-
-joblib.dump(best_model, "hybrid_crop_reco_model.pkl")
-print("Model saved as hybrid_crop_reco_model.pkl")
-
-# --------------------------------------------
-# 11. DEMO PREDICTION
-# --------------------------------------------
-
-sample = np.array([[90, 42, 43, 20.0, 80.0, 6.5, 200.0]])
-sample_df = pd.DataFrame(sample, columns=feature_cols)
-
-prediction = best_model.predict(sample_df)[0]
-print("\nRecommended crop for sample values:", prediction)
+                if ENGINE and submissions_table is not None:
+                    try:
+                        with ENGINE.begin() as conn:
+                            save_submission(conn, vals, crop, proba)
+                        st.info("Submission saved!")
+                    except Exception:
+                        pass
