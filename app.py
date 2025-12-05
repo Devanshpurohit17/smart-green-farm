@@ -101,7 +101,9 @@ if not db_url:
 
 if db_url:
     try:
-        ENGINE = create_engine(db_url, pool_pre_ping=True)
+        # require SSL explicitly (helps in many hosted environments)
+ENGINE = create_engine(db_url, pool_pre_ping=True, connect_args={"sslmode": "require"})
+
         # Build submissions table schema dynamically from feature_cols
         cols = [
             Column("id", Integer, primary_key=True, autoincrement=True),
@@ -274,3 +276,4 @@ with right_col:
 # Footer
 st.markdown("---")
 st.caption("Smart Green Farm prototype • Model A (Crop Recommendation)")
+
