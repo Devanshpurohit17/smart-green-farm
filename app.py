@@ -1,6 +1,6 @@
-
 # app.py
 
+import os
 import json
 from pathlib import Path
 from datetime import datetime
@@ -12,8 +12,7 @@ import streamlit as st
 
 from sqlalchemy import (
     create_engine, MetaData, Table, Column,
-    Integer, Float, String, Text, DateTime as SA_DateTime,
-    inspect, text
+    Integer, Float, String, Text, DateTime as SA_DateTime
 )
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -135,38 +134,42 @@ def rng(col):
     return mn, mx, mean
 
 # =========================================================
-# DATABASE (SQLite local file) + AUTO-FIX SCHEMA
+# DATABASE CONFIG – SUPABASE (Postgres) + SQLite fallback
 # =========================================================
-DB_PATH = BASE_DIR / "crop_submissions.db"
-DB_URL = f"sqlite:///{DB_PATH.as_posix()}"
-
 metadata = MetaData()
 ENGINE = None
 submissions_table = None
+DB_PATH = None
+db_source = None
+
+# 1) Try to read Supabase/Postgres URL from secrets or env
+DB_URL = None
+try:
+    if "SUPABASE_DB_URL" in st.secrets:
+        DB_URL = st.secrets["SUPABASE_DB_URL"]
+    elif "DATABASE_URL" in st.secrets:
+        DB_URL = st.secrets["DATABASE_URL"]
+except Exception:
+    DB_URL = None
+
+if not DB_URL:
+    DB_URL = os.environ.get("SUPABASE_DB_URL") or os.environ.get("DATABASE_URL")
 
 try:
-    ENGINE = create_engine(DB_URL, echo=False, future=True)
+    if DB_URL:
+        # Use Supabase Postgres
+        ENGINE = create_engine(DB_URL, pool_pre_ping=True, future=True)
+        db_source = "supabase"
+        db_status = "✅ Connected to Supabase Postgres"
+    else:
+        # Fallback: local SQLite file
+        DB_PATH = BASE_DIR / "crop_submissions.db"
+        DB_URL = f"sqlite:///{DB_PATH.as_posix()}"
+        ENGINE = create_engine(DB_URL, echo=False, future=True)
+        db_source = "sqlite"
+        db_status = f"✅ Local SQLite DB (file: {DB_PATH.name})"
 
-    inspector = inspect(ENGINE)
-    needs_recreate = True
-
-    if "crop_submissions" in inspector.get_table_names():
-        existing_cols = {c["name"] for c in inspector.get_columns("crop_submissions")}
-        required_cols = {
-            "id", "submitted_at", "name", "city", "state",
-            "N", "P", "K", "temperature", "humidity", "ph",
-            "rainfall", "predicted_crop", "predicted_proba"
-        }
-        if required_cols.issubset(existing_cols):
-            needs_recreate = False
-
-    if needs_recreate:
-        # Drop old table if it exists, then recreate with correct columns
-        with ENGINE.begin() as conn:
-            conn.execute(text("DROP TABLE IF EXISTS crop_submissions"))
-
-    metadata = MetaData()
-
+    # Define table schema (works for both SQLite and Postgres)
     submissions_table = Table(
         "crop_submissions",
         metadata,
@@ -186,13 +189,15 @@ try:
         Column("rainfall", Float),
 
         Column("predicted_crop", String(256)),
-        Column("predicted_proba", Text),  # JSON string
+        Column("predicted_proba", Text),  # JSON string of probabilities
     )
 
+    # CREATE TABLE IF NOT EXISTS crop_submissions (...)
     metadata.create_all(ENGINE)
-    db_status = f"✅ Local DB connected (file: {DB_PATH.name})"
 except SQLAlchemyError as e:
+    ENGINE = None
     submissions_table = None
+    db_source = None
     db_status = f"⚠️ DB error: {str(e)}"
 
 
@@ -229,7 +234,10 @@ def save_submission(inputs, crop, proba, name, city, state):
 with st.sidebar:
     st.markdown("### 🌾 System Status")
     st.info(db_status)
-    st.caption(f"DB path: {DB_PATH}")
+    if db_source == "sqlite" and DB_PATH is not None:
+        st.caption(f"DB file path: {DB_PATH}")
+    elif db_source == "supabase":
+        st.caption("DB: Supabase Postgres (cloud)")
 
     st.markdown("### 📊 Training Ranges")
     for col in feature_cols:
@@ -343,7 +351,7 @@ if predict_clicked:
             )
 
             if ok:
-                st.success("🗄️ This prediction has been saved in the local database.")
+                st.success("🗄️ This prediction has been saved in the database.")
             else:
                 st.warning(f"Could not save to database: {err}")
 
