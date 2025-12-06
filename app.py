@@ -142,12 +142,16 @@ submissions_table = None
 try:
     ENGINE = create_engine(DB_URL, echo=False, future=True)
 
-    # Define table
+    # Define table (NOW WITH name, city, state)
     submissions_table = Table(
         "crop_submissions",
         metadata,
         Column("id", Integer, primary_key=True, autoincrement=True),
         Column("submitted_at", SA_DateTime, nullable=False),
+
+        Column("name", String(100)),
+        Column("city", String(100)),
+        Column("state", String(100)),
 
         Column("N", Float),
         Column("P", Float),
@@ -168,7 +172,7 @@ except SQLAlchemyError as e:
     db_status = f"⚠️ DB error: {str(e)}"
 
 
-def save_submission(inputs, crop, proba):
+def save_submission(inputs, crop, proba, name, city, state):
     """Insert a row into crop_submissions table."""
     if not (ENGINE and submissions_table is not None):
         return False, "Engine or table not available"
@@ -176,6 +180,9 @@ def save_submission(inputs, crop, proba):
     try:
         ins = {
             "submitted_at": datetime.utcnow(),
+            "name": name,
+            "city": city,
+            "state": state,
             "predicted_crop": crop,
             "predicted_proba": json.dumps(
                 np.array(proba, dtype=float).tolist()
@@ -231,6 +238,14 @@ left_col, right_col = st.columns([1.9, 1.4], gap="large")
 
 with left_col:
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    st.subheader("🧑‍🌾 Farmer Details")
+
+    # 🔹 Name / City / State (asked first, required)
+    user_name = st.text_input("Name")
+    user_city = st.text_input("City")
+    user_state = st.text_input("State")
+
+    st.markdown("---")
     st.subheader("🧪 Enter Field Conditions")
 
     def safe_slider(label, mn, mx, default, step=1.0):
@@ -253,66 +268,99 @@ results_container = right_col.container()
 # PREDICTION + DISPLAY
 # =========================================================
 if predict_clicked:
-    df_in = pd.DataFrame([vals], columns=feature_cols)
-    crop = model.predict(df_in)[0]
+    # Require name/city/state before predicting
+    if not user_name or not user_city or not user_state:
+        st.warning("Please fill in **Name, City and State** before getting a recommendation.")
+    else:
+        df_in = pd.DataFrame([vals], columns=feature_cols)
+        crop = model.predict(df_in)[0]
 
-    with results_container:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.subheader("✅ Recommendation Result")
+        with results_container:
+            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+            st.subheader("✅ Recommendation Result")
 
-        st.success(f"🌿 **Recommended Crop: `{crop}`**")
+            st.success(f"🌿 **Recommended Crop for {user_name}: `{crop}`**")
 
-        if hasattr(model, "predict_proba"):
-            proba = model.predict_proba(df_in)[0]
+            if hasattr(model, "predict_proba"):
+                proba = model.predict_proba(df_in)[0]
 
-            prob_df = pd.DataFrame(
-                {"Crop": model.classes_, "Probability": np.round(proba, 3)}
-            ).sort_values("Probability", ascending=False)
+                prob_df = pd.DataFrame(
+                    {"Crop": model.classes_, "Probability": np.round(proba, 3)}
+                ).sort_values("Probability", ascending=False)
 
-            st.markdown("#### 📈 Confidence Scores")
-            st.dataframe(
-                prob_df.reset_index(drop=True),
-                use_container_width=True,
-                height=350,
+                st.markdown("#### 📈 Confidence Scores")
+                st.dataframe(
+                    prob_df.reset_index(drop=True),
+                    use_container_width=True,
+                    height=350,
+                )
+            else:
+                proba = None
+                st.info("Model does not provide probability scores.")
+
+            # Save to DB (now with name/city/state)
+            ok, err = save_submission(
+                inputs={
+                    "N": vals["N"],
+                    "P": vals["P"],
+                    "K": vals["K"],
+                    "temperature": vals["temperature"],
+                    "humidity": vals["humidity"],
+                    "ph": vals["ph"],
+                    "rainfall": vals["rainfall"],
+                },
+                crop=crop,
+                proba=proba,
+                name=user_name,
+                city=user_city,
+                state=user_state,
             )
-        else:
-            proba = None
-            st.info("Model does not provide probability scores.")
 
-        # Save to DB
-        ok, err = save_submission(
-            inputs={
-                "N": vals["N"],
-                "P": vals["P"],
-                "K": vals["K"],
-                "temperature": vals["temperature"],
-                "humidity": vals["humidity"],
-                "ph": vals["ph"],
-                "rainfall": vals["rainfall"],
-            },
-            crop=crop,
-            proba=proba,
-        )
+            if ok:
+                st.success("🗄️ This prediction has been saved in the local database.")
+            else:
+                st.warning(f"Could not save to database: {err}")
 
-        if ok:
-            st.success("🗄️ This prediction has been saved in the local database.")
-        else:
-            st.warning(f"Could not save to database: {err}")
-
-        st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
 
 # =========================================================
-# VIEW SAVED DATA
+# VIEW SAVED DATA + SEARCH
 # =========================================================
 st.markdown("## 📁 Saved Submissions (Database View)")
 with st.expander("Show all saved records"):
     if ENGINE and submissions_table is not None:
         try:
             with ENGINE.connect() as conn:
-                result = conn.execute(submissions_table.select().order_by(submissions_table.c.id.desc()))
+                result = conn.execute(
+                    submissions_table.select().order_by(submissions_table.c.id.desc())
+                )
                 rows = result.fetchall()
                 if rows:
                     df_saved = pd.DataFrame(rows, columns=result.keys())
+
+                    # 🔎 Simple search filters
+                    st.markdown("#### 🔍 Search / Filter")
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        search_name = st.text_input("Filter by Name")
+                    with col2:
+                        search_city = st.text_input("Filter by City")
+                    with col3:
+                        search_state = st.text_input("Filter by State")
+
+                    if search_name:
+                        df_saved = df_saved[
+                            df_saved["name"].str.contains(search_name, case=False, na=False)
+                        ]
+                    if search_city:
+                        df_saved = df_saved[
+                            df_saved["city"].str.contains(search_city, case=False, na=False)
+                        ]
+                    if search_state:
+                        df_saved = df_saved[
+                            df_saved["state"].str.contains(search_state, case=False, na=False)
+                        ]
+
                     st.dataframe(df_saved, use_container_width=True, height=400)
                 else:
                     st.info("No records found yet. Submit a prediction to populate the table.")
