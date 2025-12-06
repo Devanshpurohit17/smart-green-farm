@@ -3,25 +3,20 @@
 import json
 from pathlib import Path
 from datetime import datetime
+import sqlite3
 
 import joblib
 import pandas as pd
 import numpy as np
 import streamlit as st
 
-from sqlalchemy import (
-    create_engine, MetaData, Table, Column,
-    Integer, Float, String, Text, DateTime as SA_DateTime
-)
-from sqlalchemy.exc import SQLAlchemyError
-
 # =========================================================
-# BASIC CONFIG + SAFE PATHS
+# BASIC CONFIG
 # =========================================================
 BASE_DIR = Path(__file__).resolve().parent
 
 DATA_FILENAME = "Crop_recommendation.csv"
-MODEL_FILENAME = "hybrid_crop_reco_model.pkl"
+MODEL_FILENAME = "hybrid_yield_model.pkl"   # <-- YOUR ACTUAL MODEL FILE
 
 DATA_PATH = BASE_DIR / DATA_FILENAME
 MODEL_PATH = BASE_DIR / MODEL_FILENAME
@@ -89,7 +84,17 @@ def load_model():
     if not MODEL_PATH.exists():
         st.error(f"Model file not found: {MODEL_PATH.name}")
         st.stop()
-    return joblib.load(MODEL_PATH)
+    try:
+        return joblib.load(MODEL_PATH)
+    except EOFError:
+        st.error(
+            f"Model file '{MODEL_PATH.name}' seems to be empty or corrupted.\n"
+            "Please regenerate and replace it with a valid .pkl file."
+        )
+        st.stop()
+    except Exception as e:
+        st.error(f"Error loading model file: {e}")
+        st.stop()
 
 
 @st.cache_data(show_spinner=False)
@@ -133,73 +138,74 @@ def rng(col):
     return mn, mx, mean
 
 # =========================================================
-# DATABASE (SQLite local file)
+# DATABASE (SQLite local file, using sqlite3 ONLY)
 # =========================================================
 DB_PATH = BASE_DIR / "crop_submissions.db"
-DB_URL = f"sqlite:///{DB_PATH.as_posix()}"
 
-metadata = MetaData()
-ENGINE = None
-submissions_table = None
 
-try:
-    ENGINE = create_engine(DB_URL, echo=False, future=True)
-
-    # Define table (WITH name, city, state)
-    submissions_table = Table(
-        "crop_submissions",
-        metadata,
-        Column("id", Integer, primary_key=True, autoincrement=True),
-        Column("submitted_at", SA_DateTime, nullable=False),
-
-        Column("name", String(100)),
-        Column("city", String(100)),
-        Column("state", String(100)),
-
-        Column("N", Float),
-        Column("P", Float),
-        Column("K", Float),
-        Column("temperature", Float),
-        Column("humidity", Float),
-        Column("ph", Float),
-        Column("rainfall", Float),
-
-        Column("predicted_crop", String(256)),
-        Column("predicted_proba", Text),  # JSON string
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS crop_submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            submitted_at TEXT NOT NULL,
+            N REAL,
+            P REAL,
+            K REAL,
+            temperature REAL,
+            humidity REAL,
+            ph REAL,
+            rainfall REAL,
+            predicted_crop TEXT,
+            predicted_proba TEXT
+        )
+        """
     )
+    conn.commit()
+    conn.close()
 
-    metadata.create_all(ENGINE)
+
+# Try to init DB and set a nice status message
+try:
+    init_db()
     db_status = f"✅ Local DB connected (SQLite file: {DB_PATH.name})"
-except SQLAlchemyError as e:
-    submissions_table = None
-    db_status = f"⚠️ DB error: {str(e)}"
+except Exception as e:
+    db_status = f"⚠️ DB error: {e}"
 
 
-def save_submission(inputs, crop, proba, name, city, state):
-    """Insert a row into crop_submissions table."""
-    if not (ENGINE and submissions_table is not None):
-        return False, "Engine or table not available"
-
+def save_submission(inputs, crop, proba):
+    """Insert a row into crop_submissions table using sqlite3."""
     try:
-        ins = {
-            "submitted_at": datetime.utcnow(),
-            "name": name,
-            "city": city,
-            "state": state,
-            "predicted_crop": crop,
-            "predicted_proba": json.dumps(
-                np.array(proba, dtype=float).tolist()
-            ) if proba is not None else None,
-        }
-        # add numeric inputs
-        for key, val in inputs.items():
-            ins[key] = float(val)
-
-        with ENGINE.begin() as conn:
-            conn.execute(submissions_table.insert().values(**ins))
-
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO crop_submissions
+            (submitted_at, N, P, K, temperature, humidity, ph, rainfall,
+             predicted_crop, predicted_proba)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.utcnow().isoformat(),
+                float(inputs["N"]),
+                float(inputs["P"]),
+                float(inputs["K"]),
+                float(inputs["temperature"]),
+                float(inputs["humidity"]),
+                float(inputs["ph"]),
+                float(inputs["rainfall"]),
+                crop,
+                json.dumps(np.array(proba, dtype=float).tolist())
+                if proba is not None
+                else None,
+            ),
+        )
+        conn.commit()
+        conn.close()
         return True, None
-    except SQLAlchemyError as e:
+    except Exception as e:
         return False, str(e)
 
 # =========================================================
@@ -244,14 +250,6 @@ left_col, right_col = st.columns([1.9, 1.4], gap="large")
 
 with left_col:
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-    st.subheader("🧑‍🌾 Farmer Details")
-
-    # 🔹 Name / City / State (asked first, required)
-    user_name = st.text_input("Name")
-    user_city = st.text_input("City")
-    user_state = st.text_input("State")
-
-    st.markdown("---")
     st.subheader("🧪 Enter Field Conditions")
 
     def safe_slider(label, mn, mx, default, step=1.0):
@@ -266,7 +264,7 @@ with left_col:
         vals[col] = safe_slider(col, mn, mx, mean)
 
     predict_clicked = st.button("🌱 Recommend Crop", use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 results_container = right_col.container()
 
@@ -274,103 +272,75 @@ results_container = right_col.container()
 # PREDICTION + DISPLAY
 # =========================================================
 if predict_clicked:
-    # Require name/city/state before predicting
-    if not user_name or not user_city or not user_state:
-        st.warning("Please fill in **Name, City and State** before getting a recommendation.")
-    else:
-        df_in = pd.DataFrame([vals], columns=feature_cols)
-        crop = model.predict(df_in)[0]
+    df_in = pd.DataFrame([vals], columns=feature_cols)
+    crop = model.predict(df_in)[0]
 
-        with results_container:
-            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-            st.subheader("✅ Recommendation Result")
+    with results_container:
+        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+        st.subheader("✅ Recommendation Result")
 
-            st.success(f"🌿 **Recommended Crop for {user_name}: `{crop}`**")
+        st.success(f"🌿 **Recommended Crop: `{crop}`**")
 
-            if hasattr(model, "predict_proba"):
-                proba = model.predict_proba(df_in)[0]
+        if hasattr(model, "predict_proba"):
+            proba = model.predict_proba(df_in)[0]
 
-                prob_df = pd.DataFrame(
-                    {"Crop": model.classes_, "Probability": np.round(proba, 3)}
-                ).sort_values("Probability", ascending=False)
+            prob_df = pd.DataFrame(
+                {"Crop": model.classes_, "Probability": np.round(proba, 3)}
+            ).sort_values("Probability", ascending=False)
 
-                st.markdown("#### 📈 Confidence Scores")
-                st.dataframe(
-                    prob_df.reset_index(drop=True),
-                    use_container_width=True,
-                    height=350,
-                )
-            else:
-                proba = None
-                st.info("Model does not provide probability scores.")
-
-            # Save to DB (now with name/city/state)
-            ok, err = save_submission(
-                inputs={
-                    "N": vals["N"],
-                    "P": vals["P"],
-                    "K": vals["K"],
-                    "temperature": vals["temperature"],
-                    "humidity": vals["humidity"],
-                    "ph": vals["ph"],
-                    "rainfall": vals["rainfall"],
-                },
-                crop=crop,
-                proba=proba,
-                name=user_name,
-                city=user_city,
-                state=user_state,
+            st.markdown("#### 📈 Confidence Scores")
+            st.dataframe(
+                prob_df.reset_index(drop=True),
+                use_container_width=True,
+                height=350,
             )
+        else:
+            proba = None
+            st.info("Model does not provide probability scores.")
 
-            if ok:
-                st.success("🗄️ This prediction has been saved in the local database.")
-            else:
-                st.warning(f"Could not save to database: {err}")
+        # Save to DB
+        ok, err = save_submission(
+            inputs={
+                "N": vals["N"],
+                "P": vals["P"],
+                "K": vals["K"],
+                "temperature": vals["temperature"],
+                "humidity": vals["humidity"],
+                "ph": vals["ph"],
+                "rainfall": vals["rainfall"],
+            },
+            crop=crop,
+            proba=proba,
+        )
 
-            st.markdown('</div>', unsafe_allow_html=True)
+        if ok:
+            st.success("🗄️ This prediction has been saved in the local database.")
+        else:
+            st.warning(f"Could not save to database: {err}")
+
+        st.markdown("</div>", unsafe_allow_html=True)
 
 # =========================================================
-# VIEW SAVED DATA + SEARCH
+# VIEW SAVED DATA
 # =========================================================
 st.markdown("## 📁 Saved Submissions (Database View)")
 with st.expander("Show all saved records"):
-    if ENGINE and submissions_table is not None:
-        try:
-            with ENGINE.connect() as conn:
-                result = conn.execute(
-                    submissions_table.select().order_by(submissions_table.c.id.desc())
+    try:
+        if DB_PATH.exists():
+            conn = sqlite3.connect(DB_PATH)
+            df_saved = pd.read_sql_query(
+                "SELECT * FROM crop_submissions ORDER BY id DESC", conn
+            )
+            conn.close()
+
+            if not df_saved.empty:
+                st.dataframe(df_saved, use_container_width=True, height=400)
+            else:
+                st.info(
+                    "No records found yet. Submit a prediction to populate the table."
                 )
-                rows = result.fetchall()
-                if rows:
-                    df_saved = pd.DataFrame(rows, columns=result.keys())
+        else:
+            st.info("Database file not created yet. Submit a prediction first.")
+    except Exception as e:
+        st.error(f"Error reading from database: {e}")
 
-                    # 🔎 Simple search filters
-                    st.markdown("#### 🔍 Search / Filter")
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        search_name = st.text_input("Filter by Name")
-                    with col2:
-                        search_city = st.text_input("Filter by City")
-                    with col3:
-                        search_state = st.text_input("Filter by State")
-
-                    if search_name:
-                        df_saved = df_saved[
-                            df_saved["name"].str.contains(search_name, case=False, na=False)
-                        ]
-                    if search_city:
-                        df_saved = df_saved[
-                            df_saved["city"].str.contains(search_city, case=False, na=False)
-                        ]
-                    if search_state:
-                        df_saved = df_saved[
-                            df_saved["state"].str.contains(search_state, case=False, na=False)
-                        ]
-
-                    st.dataframe(df_saved, use_container_width=True, height=400)
-                else:
-                    st.info("No records found yet. Submit a prediction to populate the table.")
-        except SQLAlchemyError as e:
-            st.error(f"Error reading from database: {e}")
-    else:
-        st.warning("Database not available.")
