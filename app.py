@@ -134,11 +134,13 @@ def rng(col):
     return mn, mx, mean
 
 # =========================================================
-# DATABASE CONFIG – SUPABASE (Postgres ONLY)
+# DATABASE CONFIG – TRY SUPABASE, ELSE FALL BACK TO SQLITE
 # =========================================================
 metadata = MetaData()
 ENGINE = None
 submissions_table = None
+db_status = ""
+db_source = ""
 
 # 1) Read Supabase/Postgres URL from secrets or env
 DB_URL = None
@@ -153,19 +155,39 @@ except Exception:
 if not DB_URL:
     DB_URL = os.environ.get("SUPABASE_DB_URL") or os.environ.get("DATABASE_URL")
 
-# Fix scheme: Supabase gives postgres://, SQLAlchemy wants postgresql+psycopg2://
+# Fix scheme for SQLAlchemy if needed
 if DB_URL and DB_URL.startswith("postgres://"):
     DB_URL = DB_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 
+# Try Supabase first
 try:
     if DB_URL:
         ENGINE = create_engine(DB_URL, pool_pre_ping=True, future=True)
-        db_status = "✅ Connected to Supabase Postgres"
+        db_source = "Supabase Postgres"
+        db_status = "✅ Using Supabase Postgres"
     else:
-        db_status = "⚠️ No Supabase DB URL configured"
         ENGINE = None
+        db_status = "⚠️ No Supabase URL configured"
+except SQLAlchemyError as e:
+    ENGINE = None
+    db_status = f"⚠️ Supabase connection failed, will use local SQLite. ({e})"
 
-    if ENGINE:
+# If Supabase failed or no URL, fall back to local SQLite (for DBMS demo)
+if ENGINE is None:
+    local_db_path = BASE_DIR / "crop_submissions.db"
+    local_url = f"sqlite:///{local_db_path.as_posix()}"
+    try:
+        ENGINE = create_engine(local_url, echo=False, future=True)
+        db_source = f"Local SQLite ({local_db_path.name})"
+        if not db_status:
+            db_status = "✅ Using local SQLite database"
+    except SQLAlchemyError as e:
+        ENGINE = None
+        db_status = f"⚠️ DB error: {e}"
+
+# Define table if we have some engine
+if ENGINE is not None:
+    try:
         submissions_table = Table(
             "crop_submissions",
             metadata,
@@ -188,18 +210,18 @@ try:
             Column("predicted_proba", Text),  # JSON string of probabilities
         )
 
-        # CREATE TABLE IF NOT EXISTS crop_submissions (...)
         metadata.create_all(ENGINE)
-except SQLAlchemyError as e:
-    ENGINE = None
-    submissions_table = None
-    db_status = f"⚠️ DB error: {str(e)}"
+    except SQLAlchemyError as e:
+        ENGINE = None
+        submissions_table = None
+        db_status = f"⚠️ DB schema error: {e}"
+        db_source = ""
 
 
 def save_submission(inputs, crop, proba, name, city, state):
-    """Insert a row into crop_submissions table on Supabase."""
+    """Insert a row into crop_submissions table."""
     if not (ENGINE and submissions_table is not None):
-        # silently fail, or return error
+        # Fail silently, but return False so we can show a soft warning
         return False, "Database not available"
 
     try:
@@ -230,6 +252,8 @@ def save_submission(inputs, crop, proba, name, city, state):
 with st.sidebar:
     st.markdown("### 🌾 System Status")
     st.info(db_status)
+    if db_source:
+        st.caption(f"DB source: {db_source}")
 
     st.markdown("### 📊 Training Ranges")
     for col in feature_cols:
@@ -343,10 +367,11 @@ if predict_clicked:
             )
 
             if ok:
-                st.success("🗄️ This prediction has been saved in the Supabase database.")
+                st.success("🗄️ This prediction has been saved in the database.")
             else:
-                st.warning(f"Could not save to database: {err}")
+                # Soft warning, no stack trace
+                st.warning("Prediction done, but could not save to DB (this does not affect result).")
 
             st.markdown('</div>', unsafe_allow_html=True)
 
-# NOTE: No "Saved Submissions" view here anymore.
+# NOTE: No "Saved Submissions" view at the bottom anymore.
