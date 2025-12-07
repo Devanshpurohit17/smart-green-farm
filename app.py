@@ -134,7 +134,7 @@ def rng(col):
     return mn, mx, mean
 
 # =========================================================
-# DATABASE CONFIG – TRY SUPABASE, ELSE FALL BACK TO SQLITE
+# DATABASE: NEON POSTGRES (PRIMARY) + SQLITE FALLBACK
 # =========================================================
 metadata = MetaData()
 ENGINE = None
@@ -142,50 +142,49 @@ submissions_table = None
 db_status = ""
 db_source = ""
 
-# 1) Read Supabase/Postgres URL from secrets or env
+# ------ 1) Try Neon URL from secrets / env ------
 DB_URL = None
 try:
-    if "SUPABASE_DB_URL" in st.secrets:
-        DB_URL = st.secrets["SUPABASE_DB_URL"]
+    if "NEON_DB_URL" in st.secrets:
+        DB_URL = st.secrets["NEON_DB_URL"]
     elif "DATABASE_URL" in st.secrets:
         DB_URL = st.secrets["DATABASE_URL"]
 except Exception:
     DB_URL = None
 
 if not DB_URL:
-    DB_URL = os.environ.get("SUPABASE_DB_URL") or os.environ.get("DATABASE_URL")
+    DB_URL = os.environ.get("NEON_DB_URL") or os.environ.get("DATABASE_URL")
 
-# Fix scheme for SQLAlchemy if needed
+# Normalize scheme for SQLAlchemy + psycopg2
 if DB_URL and DB_URL.startswith("postgres://"):
     DB_URL = DB_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+elif DB_URL and DB_URL.startswith("postgresql://"):
+    DB_URL = DB_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
-# Try Supabase first
-try:
-    if DB_URL:
-        ENGINE = create_engine(DB_URL, pool_pre_ping=True, future=True)
-        db_source = "Supabase Postgres"
-        db_status = "✅ Using Supabase Postgres"
-    else:
-        ENGINE = None
-        db_status = "⚠️ No Supabase URL configured"
-except SQLAlchemyError as e:
-    ENGINE = None
-    db_status = f"⚠️ Supabase connection failed, will use local SQLite. ({e})"
-
-# If Supabase failed or no URL, fall back to local SQLite (for DBMS demo)
-if ENGINE is None:
-    local_db_path = BASE_DIR / "crop_submissions.db"
-    local_url = f"sqlite:///{local_db_path.as_posix()}"
+# Try Neon first
+if DB_URL:
     try:
-        ENGINE = create_engine(local_url, echo=False, future=True)
-        db_source = f"Local SQLite ({local_db_path.name})"
+        ENGINE = create_engine(DB_URL, pool_pre_ping=True, future=True)
+        db_source = "Neon Postgres (cloud)"
+        db_status = "✅ Connected to Neon cloud database"
+    except SQLAlchemyError as e:
+        ENGINE = None
+        db_status = f"⚠️ Neon connection failed, using local SQLite instead. ({e})"
+
+# ------ 2) Fallback: local SQLite file next to app.py ------
+if ENGINE is None:
+    DB_PATH = BASE_DIR / "crop_recomendation.db"
+    sqlite_url = f"sqlite:///{DB_PATH.as_posix()}"
+    try:
+        ENGINE = create_engine(sqlite_url, echo=False, future=True)
+        db_source = f"Local SQLite ({DB_PATH.name})"
         if not db_status:
             db_status = "✅ Using local SQLite database"
     except SQLAlchemyError as e:
         ENGINE = None
         db_status = f"⚠️ DB error: {e}"
 
-# Define table if we have some engine
+# ------ 3) Define table schema and create table ------
 if ENGINE is not None:
     try:
         submissions_table = Table(
@@ -207,7 +206,7 @@ if ENGINE is not None:
             Column("rainfall", Float),
 
             Column("predicted_crop", String(256)),
-            Column("predicted_proba", Text),  # JSON string of probabilities
+            Column("predicted_proba", Text),  # JSON string
         )
 
         metadata.create_all(ENGINE)
@@ -221,7 +220,6 @@ if ENGINE is not None:
 def save_submission(inputs, crop, proba, name, city, state):
     """Insert a row into crop_submissions table."""
     if not (ENGINE and submissions_table is not None):
-        # Fail silently, but return False so we can show a soft warning
         return False, "Database not available"
 
     try:
@@ -235,7 +233,6 @@ def save_submission(inputs, crop, proba, name, city, state):
                 np.array(proba, dtype=float).tolist()
             ) if proba is not None else None,
         }
-        # add numeric inputs
         for key, val in inputs.items():
             ins[key] = float(val)
 
@@ -247,7 +244,7 @@ def save_submission(inputs, crop, proba, name, city, state):
         return False, str(e)
 
 # =========================================================
-# SIDEBAR
+# SIDEBAR (STATUS ONLY, NO DATA TABLE)
 # =========================================================
 with st.sidebar:
     st.markdown("### 🌾 System Status")
@@ -292,7 +289,6 @@ with left_col:
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
     st.subheader("🧑‍🌾 Farmer Details")
 
-    # Name / City / State (required)
     user_name = st.text_input("Name")
     user_city = st.text_input("City")
     user_state = st.text_input("State")
@@ -317,7 +313,7 @@ with left_col:
 results_container = right_col.container()
 
 # =========================================================
-# PREDICTION + DISPLAY
+# PREDICTION + SAVE TO DB (NO DB UI)
 # =========================================================
 if predict_clicked:
     if not user_name or not user_city or not user_state:
@@ -334,7 +330,6 @@ if predict_clicked:
 
             if hasattr(model, "predict_proba"):
                 proba = model.predict_proba(df_in)[0]
-
                 prob_df = pd.DataFrame(
                     {"Crop": model.classes_, "Probability": np.round(proba, 3)}
                 ).sort_values("Probability", ascending=False)
@@ -367,11 +362,8 @@ if predict_clicked:
             )
 
             if ok:
-                st.success("🗄️ This prediction has been saved in the database.")
+                st.success("🗄️ This prediction has been stored in the database.")
             else:
-                # Soft warning, no stack trace
-                st.warning("Prediction done, but could not save to DB (this does not affect result).")
+                st.warning("Prediction done, but could not save to DB.")
 
             st.markdown('</div>', unsafe_allow_html=True)
-
-# NOTE: No "Saved Submissions" view at the bottom anymore.
