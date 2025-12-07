@@ -1,3 +1,4 @@
+
 # app.py
 
 import os
@@ -134,15 +135,13 @@ def rng(col):
     return mn, mx, mean
 
 # =========================================================
-# DATABASE CONFIG – SUPABASE (Postgres) + SQLite fallback
+# DATABASE CONFIG – SUPABASE (Postgres ONLY)
 # =========================================================
 metadata = MetaData()
 ENGINE = None
 submissions_table = None
-DB_PATH = None
-db_source = None
 
-# 1) Try to read Supabase/Postgres URL from secrets or env
+# 1) Read Supabase/Postgres URL from secrets or env
 DB_URL = None
 try:
     if "SUPABASE_DB_URL" in st.secrets:
@@ -155,56 +154,54 @@ except Exception:
 if not DB_URL:
     DB_URL = os.environ.get("SUPABASE_DB_URL") or os.environ.get("DATABASE_URL")
 
+# Fix scheme: Supabase gives postgres://, SQLAlchemy wants postgresql+psycopg2://
+if DB_URL and DB_URL.startswith("postgres://"):
+    DB_URL = DB_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+
 try:
     if DB_URL:
-        # Use Supabase Postgres
         ENGINE = create_engine(DB_URL, pool_pre_ping=True, future=True)
-        db_source = "supabase"
         db_status = "✅ Connected to Supabase Postgres"
     else:
-        # Fallback: local SQLite file
-        DB_PATH = BASE_DIR / "crop_submissions.db"
-        DB_URL = f"sqlite:///{DB_PATH.as_posix()}"
-        ENGINE = create_engine(DB_URL, echo=False, future=True)
-        db_source = "sqlite"
-        db_status = f"✅ Local SQLite DB (file: {DB_PATH.name})"
+        db_status = "⚠️ No Supabase DB URL configured"
+        ENGINE = None
 
-    # Define table schema (works for both SQLite and Postgres)
-    submissions_table = Table(
-        "crop_submissions",
-        metadata,
-        Column("id", Integer, primary_key=True, autoincrement=True),
-        Column("submitted_at", SA_DateTime, nullable=False),
+    if ENGINE:
+        submissions_table = Table(
+            "crop_submissions",
+            metadata,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("submitted_at", SA_DateTime, nullable=False),
 
-        Column("name", String(100)),
-        Column("city", String(100)),
-        Column("state", String(100)),
+            Column("name", String(100)),
+            Column("city", String(100)),
+            Column("state", String(100)),
 
-        Column("N", Float),
-        Column("P", Float),
-        Column("K", Float),
-        Column("temperature", Float),
-        Column("humidity", Float),
-        Column("ph", Float),
-        Column("rainfall", Float),
+            Column("N", Float),
+            Column("P", Float),
+            Column("K", Float),
+            Column("temperature", Float),
+            Column("humidity", Float),
+            Column("ph", Float),
+            Column("rainfall", Float),
 
-        Column("predicted_crop", String(256)),
-        Column("predicted_proba", Text),  # JSON string of probabilities
-    )
+            Column("predicted_crop", String(256)),
+            Column("predicted_proba", Text),  # JSON string of probabilities
+        )
 
-    # CREATE TABLE IF NOT EXISTS crop_submissions (...)
-    metadata.create_all(ENGINE)
+        # CREATE TABLE IF NOT EXISTS crop_submissions (...)
+        metadata.create_all(ENGINE)
 except SQLAlchemyError as e:
     ENGINE = None
     submissions_table = None
-    db_source = None
     db_status = f"⚠️ DB error: {str(e)}"
 
 
 def save_submission(inputs, crop, proba, name, city, state):
-    """Insert a row into crop_submissions table."""
+    """Insert a row into crop_submissions table on Supabase."""
     if not (ENGINE and submissions_table is not None):
-        return False, "Engine or table not available"
+        # silently fail, or return error
+        return False, "Database not available"
 
     try:
         ins = {
@@ -234,10 +231,6 @@ def save_submission(inputs, crop, proba, name, city, state):
 with st.sidebar:
     st.markdown("### 🌾 System Status")
     st.info(db_status)
-    if db_source == "sqlite" and DB_PATH is not None:
-        st.caption(f"DB file path: {DB_PATH}")
-    elif db_source == "supabase":
-        st.caption("DB: Supabase Postgres (cloud)")
 
     st.markdown("### 📊 Training Ranges")
     for col in feature_cols:
@@ -351,53 +344,10 @@ if predict_clicked:
             )
 
             if ok:
-                st.success("🗄️ This prediction has been saved in the database.")
+                st.success("🗄️ This prediction has been saved in the Supabase database.")
             else:
                 st.warning(f"Could not save to database: {err}")
 
             st.markdown('</div>', unsafe_allow_html=True)
 
-# =========================================================
-# VIEW SAVED DATA + SEARCH
-# =========================================================
-st.markdown("## 📁 Saved Submissions (Database View)")
-with st.expander("Show all saved records"):
-    if ENGINE and submissions_table is not None:
-        try:
-            with ENGINE.connect() as conn:
-                result = conn.execute(
-                    submissions_table.select().order_by(submissions_table.c.id.desc())
-                )
-                rows = result.fetchall()
-                if rows:
-                    df_saved = pd.DataFrame(rows, columns=result.keys())
-
-                    st.markdown("#### 🔍 Search / Filter")
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        search_name = st.text_input("Filter by Name")
-                    with col2:
-                        search_city = st.text_input("Filter by City")
-                    with col3:
-                        search_state = st.text_input("Filter by State")
-
-                    if search_name:
-                        df_saved = df_saved[
-                            df_saved["name"].str.contains(search_name, case=False, na=False)
-                        ]
-                    if search_city:
-                        df_saved = df_saved[
-                            df_saved["city"].str.contains(search_city, case=False, na=False)
-                        ]
-                    if search_state:
-                        df_saved = df_saved[
-                            df_saved["state"].str.contains(search_state, case=False, na=False)
-                        ]
-
-                    st.dataframe(df_saved, use_container_width=True, height=400)
-                else:
-                    st.info("No records found yet. Submit a prediction to populate the table.")
-        except SQLAlchemyError as e:
-            st.error(f"Error reading from database: {e}")
-    else:
-        st.warning("Database not available.")
+# NOTE: No "Saved Submissions" view here anymore.
